@@ -16,6 +16,11 @@ def packet(data):
 def result(port):
     response = port.read(6)
     assert len(response) == 6 and response[4:] == b'\xcc\xdd', response.hex()
+    diagnostic = port.readline().decode('ascii').strip()
+    assert diagnostic.startswith('ACK '), diagnostic
+    assert 'received_bytes=19200' in diagnostic, diagnostic
+    assert 'receive_timeout=0 checksum_error=0' in diagnostic, diagnostic
+    assert 'inference_started=1 response_sent=1' in diagnostic, diagnostic
     no_person, person = response[0] - 128, response[1] - 128
     ms = int.from_bytes(response[2:4], 'little')
     print(f'{"PERSON" if person > no_person else "NO PERSON"}: '
@@ -28,6 +33,12 @@ def silence(port, seconds):
     port.timeout = seconds
     assert port.read(1) == b'', 'Unexpected response while idle or after bad packet'
     port.timeout = previous
+
+
+def nack(port):
+    diagnostic = port.readline().decode('ascii').strip()
+    assert diagnostic.startswith('NACK '), diagnostic
+    return diagnostic
 
 
 def main():
@@ -45,13 +56,25 @@ def main():
         silence(port, 1.2)
         print('PASS: idle produces no inference response')
         port.write(gray[:-1] + b'\x01')
-        silence(port, 1.2)
-        print('PASS: invalid checksum rejected')
+        diagnostic = nack(port)
+        assert 'received_bytes=19200' in diagnostic, diagnostic
+        assert 'receive_timeout=0 checksum_error=1' in diagnostic, diagnostic
+        assert 'inference_started=0 response_sent=0' in diagnostic, diagnostic
+        silence(port, 0.2)
+        print('PASS: invalid checksum reported without inference')
+        port.write(b'\xaa')
+        diagnostic = nack(port)
+        assert 'received_bytes=0' in diagnostic, diagnostic
+        assert 'receive_timeout=1 checksum_error=0' in diagnostic, diagnostic
+        assert 'inference_started=0 response_sent=0' in diagnostic, diagnostic
         port.write(gray[:700])
-        silence(port, 1.3)
+        diagnostic = nack(port)
+        assert 'received_bytes=698' in diagnostic, diagnostic
+        assert 'receive_timeout=1 checksum_error=0' in diagnostic, diagnostic
+        assert 'inference_started=0 response_sent=0' in diagnostic, diagnostic
         port.write(b'noise\xaa' + gray)
         assert result(port) == expected
-        print('PASS: partial timeout, noise and repeated AA recovery')
+        print('PASS: partial timeout reported; noise and repeated AA recovery')
         port.write(gray + gray)
         assert result(port) == expected
         assert result(port) == expected

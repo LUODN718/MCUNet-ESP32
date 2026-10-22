@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include "driver/uart.h"
 #include "esp_check.h"
@@ -56,9 +57,20 @@ void InitSerial() {
                               UART_PIN_NO_CHANGE));
 }
 
+enum class ReceiveStatus { kPending, kPacket, kTimeout, kChecksumError };
+
+struct ReceiveDiagnostics {
+  uint32_t received_bytes = 0;
+  uint16_t received_checksum = 0;
+  uint16_t calculated_checksum = 0;
+  bool receive_timeout = false;
+  bool checksum_error = false;
+  bool inference_started = false;
+  bool response_sent = false;
+};
+
 // STM32_GUI packet: AA BB + image + little-endian XOR checksum.
-// Staging keeps incomplete or invalid packets out of the model input.
-bool ReceiveImage(int8_t* input) {
+ReceiveStatus ReceiveImage(int8_t* input, ReceiveDiagnostics* diagnostics) {
   static uint8_t image[kImageBytes];
   static int state = 0;
   static int index = 0;
@@ -69,18 +81,41 @@ bool ReceiveImage(int8_t* input) {
   uint8_t byte;
   const int count = uart_read_bytes(kUart, &byte, 1, pdMS_TO_TICKS(20));
   const int64_t now = esp_timer_get_time();
-  if (state != 0 && now - last_byte_us > 1000000) state = 0;
-  if (count != 1) return false;
+  const bool timed_out = state != 0 && now - last_byte_us > 1000000;
+  if (timed_out) {
+    diagnostics->received_bytes = index;
+    diagnostics->received_checksum = received_checksum;
+    diagnostics->calculated_checksum = checksum;
+    diagnostics->receive_timeout = true;
+    state = 0;
+    index = 0;
+    checksum = 0;
+    received_checksum = 0;
+  }
+  if (count != 1) {
+    return timed_out ? ReceiveStatus::kTimeout : ReceiveStatus::kPending;
+  }
   last_byte_us = now;
+  if (timed_out) {
+    if (byte == 0xaa) state = 1;
+    return ReceiveStatus::kTimeout;
+  }
   switch (state) {
     case 0:
-      if (byte == 0xaa) state = 1;
+      if (byte == 0xaa) {
+        state = 1;
+        index = 0;
+        checksum = 0;
+        received_checksum = 0;
+        *diagnostics = ReceiveDiagnostics{};
+      }
       break;
     case 1:
       if (byte == 0xbb) {
         state = 2;
         index = 0;
         checksum = 0;
+        received_checksum = 0;
       } else if (byte != 0xaa) {
         state = 0;
       }
@@ -88,25 +123,48 @@ bool ReceiveImage(int8_t* input) {
     case 2:
       image[index++] = byte;
       checksum ^= byte;
+      diagnostics->received_bytes = index;
+      diagnostics->calculated_checksum = checksum;
       if (index == kImageBytes) state = 3;
       break;
     case 3:
       received_checksum = byte;
+      diagnostics->received_checksum = received_checksum;
       state = 4;
       break;
     case 4:
       received_checksum |= static_cast<uint16_t>(byte) << 8;
       state = 0;
+      diagnostics->received_bytes = index;
+      diagnostics->received_checksum = received_checksum;
+      diagnostics->calculated_checksum = checksum;
       if (received_checksum == checksum) {
         memcpy(input, image, sizeof(image));
-        return true;
+        return ReceiveStatus::kPacket;
       }
-      break;
+      diagnostics->checksum_error = true;
+      return ReceiveStatus::kChecksumError;
   }
-  return false;
+  return ReceiveStatus::kPending;
 }
 
-void SendResult(const TfLiteTensor* output, int64_t elapsed_us) {
+void SendDiagnostic(const char* kind, const ReceiveDiagnostics& diagnostics) {
+  char line[240];
+  const int length = snprintf(
+      line, sizeof(line),
+      "%s received_bytes=%lu received_checksum=0x%04X "
+      "calculated_checksum=0x%04X receive_timeout=%u checksum_error=%u "
+      "inference_started=%u response_sent=%u\n",
+      kind, static_cast<unsigned long>(diagnostics.received_bytes),
+      diagnostics.received_checksum, diagnostics.calculated_checksum,
+      diagnostics.receive_timeout, diagnostics.checksum_error,
+      diagnostics.inference_started, diagnostics.response_sent);
+  if (length > 0 && length < sizeof(line)) {
+    uart_write_bytes(kUart, line, length);
+  }
+}
+
+bool SendResult(const TfLiteTensor* output, int64_t elapsed_us) {
   const uint16_t ms = static_cast<uint16_t>(
       elapsed_us / 1000 > 65535 ? 65535 : elapsed_us / 1000);
   // UI expects class 0 (no person) first, then class 1 (person).
@@ -114,7 +172,8 @@ void SendResult(const TfLiteTensor* output, int64_t elapsed_us) {
       static_cast<uint8_t>(output->data.int8[0] + 128),
       static_cast<uint8_t>(output->data.int8[1] + 128),
       static_cast<uint8_t>(ms), static_cast<uint8_t>(ms >> 8), 0xcc, 0xdd};
-  uart_write_bytes(kUart, response, sizeof(response));
+  return uart_write_bytes(kUart, response, sizeof(response)) == sizeof(response) &&
+         uart_wait_tx_done(kUart, pdMS_TO_TICKS(1000)) == ESP_OK;
 }
 }  // namespace
 
@@ -148,12 +207,24 @@ extern "C" void app_main() {
       input->dims->data[2] != 80 || input->dims->data[3] != 3 ||
       input->bytes != kImageBytes || output->type != kTfLiteInt8 ||
       output->bytes != 2) StopHere();
+  ReceiveDiagnostics diagnostics;
   while (true) {
-    if (!ReceiveImage(input->data.int8)) continue;
+    const ReceiveStatus status = ReceiveImage(input->data.int8, &diagnostics);
+    if (status == ReceiveStatus::kPending) continue;
+    if (status == ReceiveStatus::kTimeout ||
+        status == ReceiveStatus::kChecksumError) {
+      SendDiagnostic("NACK", diagnostics);
+      continue;
+    }
     const int64_t start = esp_timer_get_time();
-    if (interpreter.Invoke() != kTfLiteOk) continue;
+    diagnostics.inference_started = true;
+    if (interpreter.Invoke() != kTfLiteOk) {
+      SendDiagnostic("NACK", diagnostics);
+      continue;
+    }
     const int64_t elapsed = esp_timer_get_time() - start;
     SetDetectionLed(output->data.int8[1] > output->data.int8[0]);
-    SendResult(output, elapsed);
+    diagnostics.response_sent = SendResult(output, elapsed);
+    SendDiagnostic(diagnostics.response_sent ? "ACK" : "NACK", diagnostics);
   }
 }

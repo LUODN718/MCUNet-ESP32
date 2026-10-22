@@ -27,15 +27,21 @@ UART0 via the CH340 bridge, TX GPIO43 / RX GPIO44, 921600 baud, 8N1.
 | Direction | Format |
 | --- | --- |
 | PC to ESP | AA BB + 19200 int8 RGB bytes + uint16 little-endian XOR checksum |
-| ESP to PC | no_person+128, person+128, time_ms low, time_ms high, CC DD |
+| ESP to PC, valid packet | Existing 6-byte result frame, followed by an ASCII `ACK` diagnostics line |
+| ESP to PC, rejected packet | An ASCII `NACK` diagnostics line; no inference result frame |
 
 Checksum XORs the transmitted image bytes only; its high byte is zero.
 Class 1 greater than class 0 means PERSON, otherwise NO PERSON.
 Scores are quantized logits, not probabilities. The response byte order follows
 the actual UI parser. Wait for a response before sending the next image.
-Incomplete packets expire after one second without input. Bad packets receive
-no response; the UI reports a timeout. Runtime log output is suppressed once
-the binary UART protocol starts; boot logs still use 115200 baud.
+Incomplete packets expire after one second without input. The firmware sends a
+`NACK` line for partial-frame timeouts and checksum failures, including
+`received_bytes`, `received_checksum`, `calculated_checksum`,
+`receive_timeout`, `checksum_error`, `inference_started` and `response_sent`.
+Successful packets retain the existing six-byte result first, then send an
+`ACK` line with the same fields. This keeps the current GUI result parser
+compatible while its raw serial view can expose diagnostics. Runtime log
+output is otherwise suppressed; boot logs still use 115200 baud.
 
 ## Model and memory
 
@@ -63,9 +69,10 @@ reference but is not included or initialized by this firmware.
 ## Serial verification
 
 With pyserial installed, run `python verify_uart.py --port COM11` with the UI
-disconnected. This checks valid frames, idle silence, rejected checksums,
-partial-frame timeout recovery and back-to-back queued requests. It cannot
-measure physical LED color. Add `--image path.jpg` with Pillow installed to
+disconnected. This checks valid frames and ACK fields, idle silence, checksum
+NACKs, partial-frame timeout diagnostics and recovery, plus back-to-back queued
+requests. It cannot measure physical LED color. Add `--image path.jpg` with
+Pillow installed to
 send an image using exactly the UI's preprocessing.
 
 Hardware check on COM11 passed: valid gray input returned NO PERSON
