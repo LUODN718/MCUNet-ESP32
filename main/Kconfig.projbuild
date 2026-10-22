@@ -1,0 +1,24 @@
+menu "MCUNet VWW settings"
+
+config MCUNET_TENSOR_ARENA_SIZE_KB
+    int "Tensor arena size (KB)"
+    range 256 4096
+    default 512
+    help
+        TFLite Micro uses this arena for activations and persistent runtime data.
+
+config MCUNET_ARENA_IN_PSRAM
+    bool "Place the tensor arena in external PSRAM"
+    default y
+    help
+        PSRAM is the reliable default for N16R8 modules. Internal SRAM is faster,
+        but a large contiguous allocation may not be available after startup.
+
+config MCUNET_STATUS_LED_GPIO
+    int "Addressable RGB status LED GPIO"
+    range 0 48
+    default 48
+    help
+        GPIO connected to the board's WS2812-compatible RGB LED.
+
+endmenu
